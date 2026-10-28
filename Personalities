@@ -1,0 +1,226 @@
+enum states {STOP = 0, FORWARD, REVERSE};
+int state = STOP;
+
+// Sub-phases inside FORWARD: a normal push, or one of the tricks
+enum fwdPhase {
+  PUSH,
+  // peek-a-boo
+  CREEP_ON, CREEP_OFF, HOLD, SLAM, PAUSE,
+  // chicken out
+  CHICKEN_GO, CHICKEN_HESITATE, CHICKEN_RETREAT, CHICKEN_WAIT
+};
+fwdPhase phase = PUSH;
+unsigned long phase_start = 0;
+int creeps_done = 0;
+
+// Motor driver pins (stop = both HIGH, as in the working motor test)
+const int LEFT_PIN = 6;
+const int RIGHT_PIN = 7;
+
+// Switch pins (INPUT_PULLUP)
+const int TOGGLE_PIN = 2;
+const int LIMIT_PIN = 3;
+const int TOGGLE_ON = LOW;
+const int LIMIT_PRESSED = HIGH;
+
+// Odds per toggle flip (percent). Whatever is left over is a normal push.
+const int PEEK_CHANCE_PERCENT = 25;
+const int CHICKEN_CHANCE_PERCENT = 25;
+
+// Peek-a-boo timing (fixed)
+const int CREEP_STEPS = 4;
+const unsigned long CREEP_ON_MS = 80;
+const unsigned long CREEP_OFF_MS = 300;
+const unsigned long HOLD_MS = 700;
+const unsigned long SLAM_MAX_MS = 1500;   // safety timeout if the limit switch never trips
+const unsigned long PAUSE_MS = 500;       // rest at home before the real push
+
+// Chicken-out timing (fixed)
+const unsigned long CHICKEN_GO_MS = 500;        // how far it bravely reaches
+const unsigned long CHICKEN_HESITATE_MS = 600;  // the "uh oh" pause
+const unsigned long CHICKEN_RETREAT_MAX_MS = 1500;  // safety timeout
+const unsigned long CHICKEN_WAIT_MS = 1000;     // working up the courage
+
+// Print interval (no delay() allowed, so we use millis())
+const unsigned long PRINT_INTERVAL = 200;
+unsigned long last_print = 0;
+
+void driveMotor(int dir) {
+  if (dir == FORWARD) {
+    digitalWrite(LEFT_PIN, HIGH);
+    digitalWrite(RIGHT_PIN, LOW);
+  } else if (dir == REVERSE) {
+    digitalWrite(LEFT_PIN, LOW);
+    digitalWrite(RIGHT_PIN, HIGH);
+  } else {
+    digitalWrite(LEFT_PIN, HIGH);
+    digitalWrite(RIGHT_PIN, HIGH);
+  }
+}
+
+void enterPhase(fwdPhase p) {
+  phase = p;
+  phase_start = millis();
+}
+
+// Advances whichever trick is running; does nothing during a normal push
+void runForwardPhase(bool limit_hit) {
+  unsigned long elapsed = millis() - phase_start;
+
+  switch (phase) {
+    case PUSH:
+      break;
+
+    // ---------- peek-a-boo ----------
+    case CREEP_ON:
+      if (elapsed >= CREEP_ON_MS) {
+        driveMotor(STOP);
+        creeps_done++;
+        enterPhase(creeps_done >= CREEP_STEPS ? HOLD : CREEP_OFF);
+      }
+      break;
+
+    case CREEP_OFF:
+      if (elapsed >= CREEP_OFF_MS) {
+        driveMotor(FORWARD);
+        enterPhase(CREEP_ON);
+      }
+      break;
+
+    case HOLD:
+      if (elapsed >= HOLD_MS) {
+        if (limit_hit) {
+          // Creeps never left home, so there is nothing to slam back from
+          enterPhase(PAUSE);
+        } else {
+          driveMotor(REVERSE);   // motor has been stopped, so reversing is safe
+          enterPhase(SLAM);
+          Serial.println("Boo!");
+        }
+      }
+      break;
+
+    case SLAM:
+      if (limit_hit || elapsed >= SLAM_MAX_MS) {   // home reached (or safety timeout)
+        driveMotor(STOP);
+        enterPhase(PAUSE);
+      }
+      break;
+
+    case PAUSE:
+      if (elapsed >= PAUSE_MS) {
+        driveMotor(FORWARD);
+        enterPhase(PUSH);
+        Serial.println("Now the real push");
+      }
+      break;
+
+    // ---------- chicken out ----------
+    case CHICKEN_GO:
+      if (elapsed >= CHICKEN_GO_MS) {
+        driveMotor(STOP);
+        enterPhase(CHICKEN_HESITATE);
+        Serial.println("Hmm...");
+      }
+      break;
+
+    case CHICKEN_HESITATE:
+      if (elapsed >= CHICKEN_HESITATE_MS) {
+        if (limit_hit) {
+          // Never left home, so there is nothing to retreat from
+          enterPhase(CHICKEN_WAIT);
+        } else {
+          driveMotor(REVERSE);   // motor has been stopped, so reversing is safe
+          enterPhase(CHICKEN_RETREAT);
+          Serial.println("Nope!");
+        }
+      }
+      break;
+
+    case CHICKEN_RETREAT:
+      if (limit_hit || elapsed >= CHICKEN_RETREAT_MAX_MS) {
+        driveMotor(STOP);
+        enterPhase(CHICKEN_WAIT);
+      }
+      break;
+
+    case CHICKEN_WAIT:
+      if (elapsed >= CHICKEN_WAIT_MS) {
+        driveMotor(FORWARD);
+        enterPhase(PUSH);
+        Serial.println("Okay, for real this time");
+      }
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LEFT_PIN, OUTPUT);
+  pinMode(RIGHT_PIN, OUTPUT);
+  pinMode(TOGGLE_PIN, INPUT_PULLUP);
+  pinMode(LIMIT_PIN, INPUT_PULLUP);
+
+  randomSeed(analogRead(A0));   // A0 must be unconnected (floating)
+
+  driveMotor(STOP);
+  state = STOP;
+}
+
+void loop() {
+  bool toggle_on = (digitalRead(TOGGLE_PIN) == TOGGLE_ON);
+  bool limit_hit = (digitalRead(LIMIT_PIN) == LIMIT_PRESSED);
+
+  switch (state) {
+    case STOP:
+      // Waiting at home for someone to flip the toggle on
+      if (toggle_on) {
+        driveMotor(FORWARD);
+        state = FORWARD;
+
+        int roll = random(100);   // 0 to 99
+        if (roll < PEEK_CHANCE_PERCENT) {
+          Serial.println("Forward: peek-a-boo...");
+          creeps_done = 0;
+          enterPhase(CREEP_ON);
+        } else if (roll < PEEK_CHANCE_PERCENT + CHICKEN_CHANCE_PERCENT) {
+          Serial.println("Forward: chicken out...");
+          enterPhase(CHICKEN_GO);
+        } else {
+          Serial.println("Forward: normal push");
+          enterPhase(PUSH);
+        }
+      }
+      break;
+
+    case FORWARD:
+      if (!toggle_on) {
+        // Toggle flipped off: head home (cancels any trick in progress)
+        phase = PUSH;
+        driveMotor(REVERSE);
+        state = REVERSE;
+        Serial.println("Toggle off: reversing");
+      } else {
+        runForwardPhase(limit_hit);
+      }
+      break;
+
+    case REVERSE:
+      // Retract until the limit switch says we're home
+      if (limit_hit) {
+        driveMotor(STOP);
+        state = STOP;
+        Serial.println("Home: stopped");
+      }
+      break;
+  }
+
+  // Print switch status every PRINT_INTERVAL ms
+  if (millis() - last_print >= PRINT_INTERVAL) {
+    last_print = millis();
+    Serial.print("Toggle: ");
+    Serial.print(toggle_on ? "on" : "off");
+    Serial.print("   Limit: ");
+    Serial.println(limit_hit ? "pressed" : "open");
+  }
+}
